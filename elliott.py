@@ -1,14 +1,17 @@
 #!/usr/bin/env python3
 """
 Elliott Wave Analyzer
-Automatically identifies Elliott Wave structures on any Binance trading pair.
+Automatically identifies Elliott Wave structures on any trading symbol.
+Supports crypto (Binance) and stocks/ETFs/forex (Yahoo Finance).
 Generates interactive HTML charts + written analysis reports.
 
 Usage:
-  python3 elliott.py                          # BTC all timeframes
-  python3 elliott.py --symbol ETHUSDT         # ETH all timeframes
-  python3 elliott.py --symbol BTCUSDT --tf 4h # BTC 4h only
-  python3 elliott.py --symbol SOLUSDT --tf 1d --report
+  python3 elliott.py                            # BTC all timeframes (Binance)
+  python3 elliott.py --symbol ETHUSDT           # ETH (auto: Binance)
+  python3 elliott.py --symbol AAPL --tf 1d      # Apple stock (auto: Yahoo)
+  python3 elliott.py --symbol SPY --tf 4h       # S&P 500 ETF
+  python3 elliott.py --symbol SLV --tf 1h       # Silver ETF
+  python3 elliott.py --symbol BTCUSDT --tf 4h --report
 """
 
 import argparse
@@ -22,14 +25,34 @@ import plotly.graph_objects as go
 import requests
 from plotly.subplots import make_subplots
 
+# ─── SOURCE DETECTION ────────────────────────────────────────────────────────
+
+CRYPTO_SUFFIXES = ("USDT", "BUSD", "BTC", "ETH", "BNB", "USDC")
+
+def is_crypto(symbol: str) -> bool:
+    """Return True if symbol looks like a Binance crypto pair."""
+    return any(symbol.upper().endswith(s) for s in CRYPTO_SUFFIXES)
+
 # ─── TIMEFRAMES ──────────────────────────────────────────────────────────────
 
-TIMEFRAMES = {
+# Crypto timeframes (Binance)
+TIMEFRAMES_CRYPTO = {
     "1h":  {"interval": "1h",  "label": "1 Hour",  "start": "2024-01-01"},
     "4h":  {"interval": "4h",  "label": "4 Hour",  "start": "2023-01-01"},
     "12h": {"interval": "12h", "label": "12 Hour", "start": "2022-11-01"},
     "1d":  {"interval": "1d",  "label": "Daily",   "start": "2022-11-01"},
 }
+
+# Stock/ETF timeframes (Yahoo Finance)
+# Yahoo limits hourly to ~60 days, so 1h/4h use period; 1d/1w use start date
+TIMEFRAMES_STOCK = {
+    "1h":  {"interval": "1h",  "label": "1 Hour",  "period": "60d",   "start": None},
+    "4h":  {"interval": "1h",  "label": "4 Hour",  "period": "60d",   "start": None,  "resample": "4h"},
+    "1d":  {"interval": "1d",  "label": "Daily",   "period": None,    "start": "2022-01-01"},
+    "1w":  {"interval": "1wk", "label": "Weekly",  "period": None,    "start": "2018-01-01"},
+}
+
+TIMEFRAMES = TIMEFRAMES_CRYPTO  # overridden per-symbol at runtime
 
 # ─── DATA FETCH ───────────────────────────────────────────────────────────────
 
@@ -73,6 +96,49 @@ def fetch_binance(symbol: str, interval: str, start_date: str) -> pd.DataFrame:
     for col in ["open", "high", "low", "close", "volume"]:
         df[col] = df[col].astype(float)
     return df[["ts", "open", "high", "low", "close", "volume"]].reset_index(drop=True)
+
+def fetch_yahoo(symbol: str, tf_cfg: dict) -> pd.DataFrame:
+    """Fetch OHLCV from Yahoo Finance for stocks, ETFs, indices, forex."""
+    try:
+        import yfinance as yf
+    except ImportError:
+        raise RuntimeError("yfinance not installed. Run: pip install yfinance")
+
+    interval = tf_cfg["interval"]
+    period   = tf_cfg.get("period")
+    start    = tf_cfg.get("start")
+    resample = tf_cfg.get("resample")
+
+    ticker = yf.Ticker(symbol)
+    if period:
+        raw = ticker.history(period=period, interval=interval)
+    else:
+        raw = ticker.history(start=start, interval=interval)
+
+    if raw.empty:
+        raise RuntimeError(f"No data returned for {symbol}. Check the ticker symbol.")
+
+    raw = raw.reset_index()
+    # yfinance uses 'Datetime' for intraday, 'Date' for daily/weekly
+    ts_col = "Datetime" if "Datetime" in raw.columns else "Date"
+    raw = raw.rename(columns={
+        ts_col: "ts", "Open": "open", "High": "high",
+        "Low": "low", "Close": "close", "Volume": "volume"
+    })
+    raw = raw[["ts", "open", "high", "low", "close", "volume"]].copy()
+    raw["ts"] = pd.to_datetime(raw["ts"], utc=True)
+    raw = raw.dropna(subset=["close"]).reset_index(drop=True)
+
+    # Resample 1h → 4h if needed
+    if resample:
+        raw = raw.set_index("ts")
+        raw = raw.resample(resample).agg({
+            "open": "first", "high": "max", "low": "min",
+            "close": "last", "volume": "sum"
+        }).dropna(subset=["close"]).reset_index()
+
+    return raw
+
 
 # ─── SWING DETECTION ─────────────────────────────────────────────────────────
 
@@ -415,15 +481,29 @@ def generate_report(symbol: str, tf: str, df: pd.DataFrame,
 
 # ─── MAIN ─────────────────────────────────────────────────────────────────────
 
-def run(symbol: str, tf: str, output_dir: str, report: bool) -> str:
-    cfg   = TIMEFRAMES[tf]
+def run(symbol: str, tf: str, output_dir: str, report: bool, source: str) -> str:
+    crypto = (source == "binance") or (source == "auto" and is_crypto(symbol))
+    tf_map = TIMEFRAMES_CRYPTO if crypto else TIMEFRAMES_STOCK
+
+    if tf not in tf_map:
+        available = list(tf_map.keys())
+        raise ValueError(f"Timeframe '{tf}' not available for {'crypto' if crypto else 'stocks'}. "
+                         f"Available: {available}")
+
+    cfg   = tf_map[tf]
     label = cfg["label"]
-    print(f"\n[{symbol} {tf}] Fetching from {cfg['start']}…")
+    src   = "Binance" if crypto else "Yahoo Finance"
+    print(f"\n[{symbol} {tf}] Source: {src}  |  Fetching…")
 
-    df = fetch_binance(symbol, cfg["interval"], cfg["start"])
-    print(f"[{symbol} {tf}] {len(df)} candles  |  last close: ${df['close'].iloc[-1]:,.2f}")
+    if crypto:
+        df = fetch_binance(symbol, cfg["interval"], cfg["start"])
+    else:
+        df = fetch_yahoo(symbol, cfg)
 
-    order = {"1h": 8, "4h": 6, "12h": 7, "1d": 8}.get(tf, 6)
+    last = df["close"].iloc[-1]
+    print(f"[{symbol} {tf}] {len(df)} candles  |  last: ${last:,.2f}")
+
+    order = {"1h": 8, "4h": 6, "12h": 7, "1d": 8, "1w": 5}.get(tf, 6)
     df    = find_swings(df, order=order)
     swings = get_swing_points(df)
     print(f"[{symbol} {tf}] {len(swings)} swing points detected")
@@ -439,7 +519,7 @@ def run(symbol: str, tf: str, output_dir: str, report: bool) -> str:
             print(f"[{symbol} {tf}] A-B-C correction detected")
 
     fig  = build_chart(df, swings, waves, correction, symbol, label)
-    slug = symbol.lower().replace("/", "")
+    slug = symbol.lower().replace("/", "").replace("^", "")
     out  = os.path.join(output_dir, f"{slug}_elliott_{tf}.html")
     fig.write_html(out, include_plotlyjs="cdn")
     print(f"[{symbol} {tf}] Chart → {out}")
@@ -457,40 +537,54 @@ def run(symbol: str, tf: str, output_dir: str, report: bool) -> str:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Elliott Wave Analyzer — auto-detects wave structures on any Binance pair",
+        description="Elliott Wave Analyzer — crypto (Binance) and stocks/ETFs (Yahoo Finance)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  python3 elliott.py                            BTC all timeframes
-  python3 elliott.py --symbol ETHUSDT           ETH all timeframes
-  python3 elliott.py --symbol SOLUSDT --tf 4h   SOL 4h only
-  python3 elliott.py --symbol BTCUSDT --tf 1d --report
+  python3 elliott.py                              BTC/USDT all crypto timeframes
+  python3 elliott.py --symbol ETHUSDT --tf 4h    ETH 4h
+  python3 elliott.py --symbol AAPL --tf 1d       Apple daily
+  python3 elliott.py --symbol SPY --tf 1h        S&P 500 ETF hourly
+  python3 elliott.py --symbol SLV --tf 1d --report
+  python3 elliott.py --symbol TSLA --tf 1w       Tesla weekly
+  python3 elliott.py --symbol GLD --tf 4h        Gold ETF 4h
+
+Crypto timeframes:   1h, 4h, 12h, 1d
+Stock timeframes:    1h, 4h, 1d, 1w
         """
     )
     parser.add_argument("--symbol", default="BTCUSDT",
-                        help="Binance trading pair (default: BTCUSDT)")
-    parser.add_argument("--tf", choices=list(TIMEFRAMES.keys()), default=None,
-                        help="Timeframe. Omit to run all timeframes.")
+                        help="Ticker symbol: BTCUSDT (crypto) or AAPL/SPY/SLV (stocks)")
+    parser.add_argument("--tf", default=None,
+                        help="Timeframe (crypto: 1h/4h/12h/1d  stocks: 1h/4h/1d/1w). Omit for all.")
+    parser.add_argument("--source", choices=["auto", "binance", "yahoo"], default="auto",
+                        help="Data source (default: auto-detect from symbol)")
     parser.add_argument("--report", action="store_true",
                         help="Print and save a text analysis report")
     parser.add_argument("--out", default=None,
                         help="Output directory (default: current directory)")
     args = parser.parse_args()
 
-    symbol     = args.symbol.upper()
-    tfs        = [args.tf] if args.tf else list(TIMEFRAMES.keys())
+    symbol = args.symbol.upper()
+    source = args.source
+    crypto = (source == "binance") or (source == "auto" and is_crypto(symbol))
+    tf_map = TIMEFRAMES_CRYPTO if crypto else TIMEFRAMES_STOCK
+
+    tfs        = [args.tf] if args.tf else list(tf_map.keys())
     output_dir = args.out or os.path.dirname(os.path.abspath(__file__))
     os.makedirs(output_dir, exist_ok=True)
 
-    print(f"\n{'='*50}")
+    src_label = "Binance (crypto)" if crypto else "Yahoo Finance (stocks/ETFs)"
+    print(f"\n{'='*55}")
     print(f"  Elliott Wave Analyzer")
-    print(f"  Symbol: {symbol}  |  Timeframes: {', '.join(tfs)}")
-    print(f"{'='*50}")
+    print(f"  Symbol: {symbol}  |  Source: {src_label}")
+    print(f"  Timeframes: {', '.join(tfs)}")
+    print(f"{'='*55}")
 
     outputs = []
     for tf in tfs:
         try:
-            out = run(symbol, tf, output_dir, args.report)
+            out = run(symbol, tf, output_dir, args.report, source)
             outputs.append(out)
         except Exception as e:
             print(f"[ERROR] {symbol} {tf}: {e}")
